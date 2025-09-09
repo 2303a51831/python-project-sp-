@@ -1,0 +1,150 @@
+# ==========================================================
+# Stroke Prediction (Occupation-Based Risk Stratification)
+# Publication-Ready ML Pipeline (RF + LR + XGBoost Stacking)
+# Author: [Your Name] | B.Tech CSE 3rd Year Project
+# ==========================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from imblearn.over_sampling import SMOTE   # pip install imbalanced-learn
+from xgboost import XGBClassifier          # pip install xgboost
+import seaborn as sns
+
+# STEP 1: Load Dataset
+df = pd.read_csv("stroke_prediction_dataset.csv")
+
+# STEP 2: Data Cleaning
+df.drop_duplicates(inplace=True)
+df.fillna(df.median(numeric_only=True), inplace=True)
+for col in df.select_dtypes(include=['object']).columns:
+    df[col] = df[col].fillna(df[col].mode()[0])
+
+# Encode categorical
+for col in df.select_dtypes(include=['object']).columns:
+    df[col] = LabelEncoder().fit_transform(df[col])
+
+# STEP 3: Identify Target Column
+possible_targets = ["Diagnosis_Stroke", "stroke", "Diagnosis", "Outcome", "Target"]
+target_col = next((col for col in possible_targets if col in df.columns), None)
+
+if target_col is None:
+    raise ValueError("❌ No valid target column found!")
+print(f"\n🎯 Using target column: {target_col}")
+
+X = df.drop(target_col, axis=1)
+y = df[target_col]
+
+# STEP 4: Handle Class Imbalance with SMOTE
+print("\n⚖️ Class distribution before SMOTE:\n", y.value_counts())
+smote = SMOTE(random_state=42)
+X_res, y_res = smote.fit_resample(X, y)
+print("⚖️ Class distribution after SMOTE:\n", y_res.value_counts())
+
+# STEP 5: Standardize Features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_res)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y_res, test_size=0.2, stratify=y_res, random_state=42
+)
+
+# STEP 6: Define Base Models with Hyperparameter Tuning
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# RandomForest Tuning
+rf = RandomForestClassifier(random_state=42, class_weight="balanced")
+rf_params = {
+    'n_estimators': [200, 300, 500],
+    'max_depth': [10, 20, None],
+    'min_samples_split': [2, 5],
+    'min_samples_leaf': [1, 2],
+    'max_features': ['sqrt', 'log2']
+}
+grid_rf = GridSearchCV(rf, rf_params, cv=cv, scoring='roc_auc', n_jobs=-1, verbose=1)
+grid_rf.fit(X_train, y_train)
+best_rf = grid_rf.best_estimator_
+print("\n🌲 Best RandomForest params:", grid_rf.best_params_)
+
+# Logistic Regression Tuning
+lr = LogisticRegression(max_iter=2000, class_weight="balanced", solver="liblinear")
+lr_params = {'C': [0.1, 1, 10], 'penalty': ['l1', 'l2']}
+grid_lr = GridSearchCV(lr, lr_params, cv=cv, scoring='roc_auc', n_jobs=-1, verbose=1)
+grid_lr.fit(X_train, y_train)
+best_lr = grid_lr.best_estimator_
+print("\n📊 Best Logistic Regression params:", grid_lr.best_params_)
+
+# XGBoost Tuning
+xgb = XGBClassifier(eval_metric='logloss', use_label_encoder=False, random_state=42)
+xgb_params = {
+    'n_estimators': [200, 300],
+    'max_depth': [3, 6, 10],
+    'learning_rate': [0.01, 0.1, 0.2],
+    'subsample': [0.8, 1],
+    'colsample_bytree': [0.8, 1]
+}
+grid_xgb = GridSearchCV(xgb, xgb_params, cv=cv, scoring='roc_auc', n_jobs=-1, verbose=1)
+grid_xgb.fit(X_train, y_train)
+best_xgb = grid_xgb.best_estimator_
+print("\n🚀 Best XGBoost params:", grid_xgb.best_params_)
+
+# STEP 7: Stacking Ensemble (Meta-learner = Logistic Regression)
+stack_model = StackingClassifier(
+    estimators=[('rf', best_rf), ('lr', best_lr), ('xgb', best_xgb)],
+    final_estimator=LogisticRegression(max_iter=2000, class_weight="balanced"),
+    cv=cv,
+    n_jobs=-1
+)
+stack_model.fit(X_train, y_train)
+
+# STEP 8: Evaluation
+y_pred = stack_model.predict(X_test)
+y_probs = stack_model.predict_proba(X_test)[:, 1]
+
+print("\n=== Classification Report ===")
+print(classification_report(y_test, y_pred))
+print("ROC-AUC:", roc_auc_score(y_test, y_probs))
+
+# Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
+
+# STEP 9: Risk Stratification
+df["Stroke_Probability"] = stack_model.predict_proba(scaler.transform(X))[:, 1] * 100
+
+def risk_level(p):
+    if p < 30: return "Low Risk"
+    elif p < 60: return "Medium Risk"
+    else: return "High Risk"
+
+df["Risk_Level"] = df["Stroke_Probability"].apply(risk_level)
+
+# STEP 10: Occupation-wise Risk Report
+if "Work Type" in df.columns:
+    occupation_report = (
+        df.groupby("Work Type")["Risk_Level"]
+        .value_counts(normalize=True)
+        .unstack()
+        .fillna(0) * 100
+    )
+    print("\n=== Occupation-wise Risk Stratification (%) ===")
+    print(occupation_report)
+
+    occupation_report.plot(kind="bar", stacked=True, figsize=(10,6), colormap="coolwarm")
+    plt.title("Stroke Risk Stratification by Occupation")
+    plt.ylabel("Percentage (%)")
+    plt.xlabel("Occupation")
+    plt.legend(title="Risk Level")
+    plt.show()
+else:
+    print("⚠️ No 'Work Type' column found in dataset! Skipping occupation analysis.")
